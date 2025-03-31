@@ -1,4 +1,4 @@
-# Mar 31 1:39pm
+# Mar 31 4:00pm
 import argparse
 import nltk
 from nltk.corpus import stopwords
@@ -9,6 +9,7 @@ import spacy
 import requests
 from bs4 import BeautifulSoup
 import json
+import google.generativeai as genai
 
 # Try importing newspaper3k. If not installed, related logic will be skipped.
 try:
@@ -198,27 +199,32 @@ def test_run_spanbert(spanbert_instance):
 
 
 
-
 def run_gemini(sentence, subject, obj, gemini_api_key):
-    if palm is None:
-        return "", 0.0
-    palm.configure(api_key=gemini_api_key)
-    prompt = (
-        f"Extract the relation between the following entities in the sentence. "
-        f"Sentence: \"{sentence}\". "
-        f"Subject: \"{subject}\". "
-        f"Object: \"{obj}\". "
-        f"Return a JSON with keys 'relation' and 'confidence'."
+    genai.configure(api_key=gemini_api_key)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    generation_config = genai.types.GenerationConfig(
+    max_output_tokens=200,
+    temperature=0.2,
+    top_p=1,
+    top_k=32
     )
+    prompt = f"""
+        Given the sentence:
+        \"{sentence}\"
+
+        What is the relation between \"{subject}\" and \"{obj}\"? 
+        Only answer with the relation name if it exists, otherwise say "no_relation".
+        """
+
     try:
-        response = palm.generate_text(prompt=prompt, model="models/gemini-2", temperature=0.0)
-        result = json.loads(response.result)
-        relation = result.get("relation", "")
-        confidence = float(result.get("confidence", 0.0))
-        return relation, confidence
+        response = model.generate_content(prompt, generation_config=generation_config)
+        result = response.text.strip().lower()
+        return result, 1.0  
     except Exception as e:
-        print(f"Error in Gemini API call: {e}")
-        return "", 0.0
+        print("Error in Gemini API call:", e)
+        return "no_relation", 0.0
+
 
 def extract_relation(candidate, method, confidence_threshold, gemini_api_key, spanbert_instance=None):
     sentence, subject, obj = candidate
@@ -226,7 +232,7 @@ def extract_relation(candidate, method, confidence_threshold, gemini_api_key, sp
         relation, confidence = run_spanbert(sentence, subject, obj, spanbert_instance)
         if confidence < confidence_threshold:
             return None
-    elif method == "-gemini":
+    elif method == "gemini":
         relation, confidence = run_gemini(sentence, subject, obj, gemini_api_key)
     else:
         return None
@@ -290,7 +296,7 @@ def process_url(url, url_index, total_urls, args, spanbert_instance):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("method", choices=["spanbert", "-gemini"])
+    parser.add_argument("method", choices=["spanbert", "gemini"])
     parser.add_argument("google_api_key")
     parser.add_argument("google_engine_id")
     parser.add_argument("google_gemini_api_key")
