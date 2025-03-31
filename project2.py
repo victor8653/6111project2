@@ -9,20 +9,20 @@ import requests
 from bs4 import BeautifulSoup
 import json
 
-# 尝试导入 newspaper3k，如果没有安装，可注释掉相关逻辑
+# Try importing newspaper3k. If not installed, related logic will be skipped.
 try:
     from newspaper import Article
 except ImportError:
     Article = None
 
-# 尝试导入 Google Gemini API
+# Try importing Google Gemini API
 try:
     import google.generativeai as palm
 except ImportError:
     print("Please install google-generativeai: pip install -q -U google-generativeai")
     palm = None
 
-# 从 SpanBERT 仓库导入 SpanBERT 类
+# Import SpanBERT class from the SpanBERT repository
 from SpanBERT.spanbert import SpanBERT
 
 
@@ -54,7 +54,7 @@ def extract_text(html):
     改进后的文本提取：尝试 newspaper3k、readability-lxml、然后回退到 BeautifulSoup。
     """
     text = ""
-    # 尝试 newspaper3k 提取
+    # Try extracting with newspaper3k
     try:
         if Article is not None:
             article = Article(url="")
@@ -64,7 +64,7 @@ def extract_text(html):
     except Exception:
         pass
 
-    # 如果 newspaper3k 结果不足，则尝试 readability-lxml
+    # If newspaper3k result is insufficient, try readability-lxml
     if not text or len(text) < 200:
         try:
             from readability import Document
@@ -74,7 +74,7 @@ def extract_text(html):
         except Exception:
             pass
 
-    # 如果仍然不足，则使用 BeautifulSoup
+    # If still insufficient, use BeautifulSoup
     if not text or len(text) < 200:
         soup = BeautifulSoup(html, 'html.parser')
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
@@ -137,13 +137,12 @@ def candidate_entity_pairs(annotations, relation):
 
 def run_spanbert(sentence, subject, obj, spanbert_instance):
     """
-    简化示例：仅将 subject 视为 tokens[0]，object 视为 tokens[-1]。
-    建议你使用 spaCy 的 tokenization 来定位 subject、object 在句子中的精确位置。
+    Simplified example: assume subject is tokens[0], object is tokens[-1].
+    It's recommended to use spaCy tokenization to locate exact positions.
     """
     tokens = sentence.split()
     subj_idx = 0
     obj_idx = len(tokens) - 1
-    # 这里假设 subject 是 PERSON, object 是 ORG，你需要根据 relation 类型来动态决定
     example = {
         'tokens': tokens,
         'subj': (subject, "PERSON", (subj_idx, subj_idx + 1)),
@@ -194,7 +193,7 @@ def deduplicate_relations(relations):
         key = (s.strip(), r.strip(), o.strip())
         if key not in seen or seen[key] < c:
             seen[key] = c
-    # 按置信度降序
+    # 
     return sorted([(k[0], k[1], k[2], seen[k]) for k in seen], key=lambda x: x[3], reverse=True)
 
 def main():
@@ -209,10 +208,8 @@ def main():
     parser.add_argument("k", type=int)
     args = parser.parse_args()
 
-    # 如果 method 是 spanbert，则加载预训练的 SpanBERT 模型
+    # Load SpanBERT model if using spanbert method
     spanbert_instance = None
-
-
     if args.method == "spanbert":
         print("Loading SpanBERT model...")
         spanbert_instance = SpanBERT("SpanBERT/pretrained_spanbert")
@@ -256,7 +253,7 @@ def main():
         if len(extracted) >= args.k:
             break
 
-        # 选择一个新的种子元组来生成下一次查询
+        # Choose a new seed tuple for next query
         for s, r, o, _ in extracted:
             key = (s.strip(), r.strip(), o.strip())
             if key not in used:
