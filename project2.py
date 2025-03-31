@@ -1,4 +1,3 @@
-
 import argparse
 import nltk
 from nltk.corpus import stopwords
@@ -8,25 +7,37 @@ import numpy as np
 import spacy
 import requests
 from bs4 import BeautifulSoup
+import json
+
+# 尝试导入 newspaper3k，如果没有安装，可注释掉相关逻辑
+try:
+    from newspaper import Article
+except ImportError:
+    Article = None
+
+# 尝试导入 Google Gemini API
+try:
+    import google.generativeai as palm
+except ImportError:
+    print("Please install google-generativeai: pip install -q -U google-generativeai")
+    palm = None
+
+# 从 SpanBERT 仓库导入 SpanBERT 类
+from SpanBERT.spanbert import SpanBERT
+
+
 
 nltk.download('stopwords')
 nltk.download('punkt')
 
-#spaCy model
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.load("en_core_web_lg")
 
-# Define a set of navigation/boilerplate words to filter out non-content entities
 NAV_WORDS = {"home", "contact", "navigation", "upload", "community", "login", "signup", "donate", "about"}
 
-
 def search_google(api_key, engine_id, query):
-    """
-    利用 Google Custom Search API 执行搜索，并返回结果。
-    """
     service = build("customsearch", "v1", developerKey=api_key)
     res = service.cse().list(q=query, cx=engine_id).execute()
     return res
-
 
 def download_webpage(url, timeout=10):
     try:
@@ -34,241 +45,231 @@ def download_webpage(url, timeout=10):
         response = requests.get(url, headers=headers, timeout=timeout)
         if response.status_code == 200:
             return response.text
-        else:
-            print(f"Request to {url} returned status code: {response.status_code}")
     except Exception as e:
         print(f"Error while requesting {url}: {e}")
     return None
 
 def extract_text(html):
     """
-    Extract main content text from HTML. 
+    改进后的文本提取：尝试 newspaper3k、readability-lxml、然后回退到 BeautifulSoup。
     """
-    soup = BeautifulSoup(html, 'html.parser')
-    # Remove script and style tags
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    # Try to find <article> tag
-    article = soup.find("article")
-    if article:
-        text = article.get_text(separator=" ", strip=True)
-    else:
-        # Try to find a div with id 'main'
-        main_div = soup.find("div", id="main")
-        if main_div:
-            text = main_div.get_text(separator=" ", strip=True)
+    text = ""
+    # 尝试 newspaper3k 提取
+    try:
+        if Article is not None:
+            article = Article(url="")
+            article.set_html(html)
+            article.parse()
+            text = article.text
+    except Exception:
+        pass
+
+    # 如果 newspaper3k 结果不足，则尝试 readability-lxml
+    if not text or len(text) < 200:
+        try:
+            from readability import Document
+            doc = Document(html)
+            extracted_html = doc.summary()
+            text = BeautifulSoup(extracted_html, 'html.parser').get_text(separator=" ", strip=True)
+        except Exception:
+            pass
+
+    # 如果仍然不足，则使用 BeautifulSoup
+    if not text or len(text) < 200:
+        soup = BeautifulSoup(html, 'html.parser')
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        article_tag = soup.find("article")
+        if article_tag:
+            text = article_tag.get_text(separator=" ", strip=True)
         else:
-            # Fallback: extract all text
-            text = soup.get_text(separator=" ", strip=True)
+            main_div = soup.find("div", id="main") or soup.find("div", class_="content")
+            if main_div:
+                text = main_div.get_text(separator=" ", strip=True)
+            else:
+                text = soup.get_text(separator=" ", strip=True)
+
+    text = " ".join(text.split())
     return text[:10000]
 
-
-#  spaCy footnote
 def annotate_text(text):
-    """
-    Use spaCy to returns a list of tuples: (sentence, [(entity, label), ...])
-    """
     doc = nlp(text)
     annotated_sentences = []
-    # iterate each sentence
     for sent in doc.sents:
+        s = sent.text.strip()
+        if len(s) < 20:
+            continue
+        lower_s = s.lower()
+        if sum(1 for nav in NAV_WORDS if nav in lower_s) > 1:
+            continue
         entities = [(ent.text, ent.label_) for ent in sent.ents]
-        annotated_sentences.append((sent.text, entities))
+        annotated_sentences.append((s, entities))
     return annotated_sentences
 
-
 def is_valid_entity(entity):
-    """
-    Check if an entity is valid (not too short and not a common navigation word).
-    """
     entity_lower = entity.lower().strip()
-    if len(entity_lower) < 3:
-        return False
-    if entity_lower in NAV_WORDS:
-        return False
-    return True
-
+    return len(entity_lower) >= 3 and entity_lower not in NAV_WORDS
 
 def candidate_entity_pairs(annotations, relation):
-    """
-    Construct candidate entity pairs based on the target relation.
-    
-    Target relations:
-      1,2 (Schools_Attended or Work_For): subject: PERSON, object: ORG (or GPE)
-      3 (Live_In): subject: PERSON, object: GPE or LOC
-      4 (Top_Member_Employees): subject: ORG, object: PERSON
-      
-    Returns a list of tuples: (sentence, subject, object)
-    """
-    candidate_pairs = []
+    pairs = []
     for sentence, entities in annotations:
-        # Filter out invalid entities
-        valid_entities = [(ent, label) for ent, label in entities if is_valid_entity(ent)]
-        for i in range(len(valid_entities)):
-            for j in range(i + 1, len(valid_entities)):
-                e1, label1 = valid_entities[i]
-                e2, label2 = valid_entities[j]
-                if relation in [1, 2]:  # Schools_Attended or Work_For
-                    if label1 == "PERSON" and label2 in ["ORG", "GPE"]:
-                        candidate_pairs.append((sentence, e1, e2))
-                    elif label1 in ["ORG", "GPE"] and label2 == "PERSON":
-                        candidate_pairs.append((sentence, e2, e1))
+        valid = [(ent, label) for ent, label in entities if is_valid_entity(ent)]
+        for i in range(len(valid)):
+            for j in range(i + 1, len(valid)):
+                e1, l1 = valid[i]
+                e2, l2 = valid[j]
+                if relation in [1, 2]:  # Schools_Attended / Work_For
+                    if l1 == "PERSON" and l2 in ["ORG", "GPE"]:
+                        pairs.append((sentence, e1, e2))
+                    elif l2 == "PERSON" and l1 in ["ORG", "GPE"]:
+                        pairs.append((sentence, e2, e1))
                 elif relation == 3:  # Live_In
-                    if label1 == "PERSON" and label2 in ["GPE", "LOC"]:
-                        candidate_pairs.append((sentence, e1, e2))
-                    elif label2 == "PERSON" and label1 in ["GPE", "LOC"]:
-                        candidate_pairs.append((sentence, e2, e1))
+                    if l1 == "PERSON" and l2 in ["GPE", "LOC"]:
+                        pairs.append((sentence, e1, e2))
+                    elif l2 == "PERSON" and l1 in ["GPE", "LOC"]:
+                        pairs.append((sentence, e2, e1))
                 elif relation == 4:  # Top_Member_Employees
-                    if label1 == "ORG" and label2 == "PERSON":
-                        candidate_pairs.append((sentence, e1, e2))
-                    elif label1 == "PERSON" and label2 == "ORG":
-                        candidate_pairs.append((sentence, e2, e1))
-    return candidate_pairs
+                    if l1 == "ORG" and l2 == "PERSON":
+                        pairs.append((sentence, e1, e2))
+                    elif l2 == "ORG" and l1 == "PERSON":
+                        pairs.append((sentence, e2, e1))
+    return pairs
 
+def run_spanbert(sentence, subject, obj, spanbert_instance):
+    """
+    简化示例：仅将 subject 视为 tokens[0]，object 视为 tokens[-1]。
+    建议你使用 spaCy 的 tokenization 来定位 subject、object 在句子中的精确位置。
+    """
+    tokens = sentence.split()
+    subj_idx = 0
+    obj_idx = len(tokens) - 1
+    # 这里假设 subject 是 PERSON, object 是 ORG，你需要根据 relation 类型来动态决定
+    example = {
+        'tokens': tokens,
+        'subj': (subject, "PERSON", (subj_idx, subj_idx + 1)),
+        'obj': (obj, "ORGANIZATION", (obj_idx, obj_idx + 1))
+    }
+    preds = spanbert_instance.predict([example])
+    if preds and len(preds) > 0:
+        relation, confidence = preds[0]
+        return relation, confidence
+    return "", 0.0
 
-def extract_relation(candidate, method, confidence_threshold):
-    """
-    Call the relation extraction model on a candidate entity pair.
-    This is a placeholder implementation; replace it with an actual call to SpanBERT or Gemini API.
-    Returns a tuple: (subject, relation, object, confidence).
-    If the extraction confidence is below the threshold (for SpanBERT), returns None.
-    """
+def run_gemini(sentence, subject, obj, gemini_api_key):
+    if palm is None:
+        return "", 0.0
+    palm.configure(api_key=gemini_api_key)
+    prompt = (
+        f"Extract the relation between the following entities in the sentence. "
+        f"Sentence: \"{sentence}\". "
+        f"Subject: \"{subject}\". "
+        f"Object: \"{obj}\". "
+        f"Return a JSON with keys 'relation' and 'confidence'."
+    )
+    try:
+        response = palm.generate_text(prompt=prompt, model="models/gemini-2", temperature=0.0)
+        result = json.loads(response.result)
+        relation = result.get("relation", "")
+        confidence = float(result.get("confidence", 0.0))
+        return relation, confidence
+    except Exception as e:
+        print(f"Error in Gemini API call: {e}")
+        return "", 0.0
+
+def extract_relation(candidate, method, confidence_threshold, gemini_api_key, spanbert_instance=None):
     sentence, subject, obj = candidate
     if method == "spanbert":
-        # TODO: Replace with actual SpanBERT call
-        extracted_relation = "per:employee_of"
-        confidence = 0.95  # Example confidence
+        relation, confidence = run_spanbert(sentence, subject, obj, spanbert_instance)
+        if confidence < confidence_threshold:
+            return None
     elif method == "-gemini":
-        # TODO: Replace with actual Gemini API call
-        extracted_relation = "per:employee_of"
-        confidence = 1.0
+        relation, confidence = run_gemini(sentence, subject, obj, gemini_api_key)
     else:
         return None
-
-    if method == "spanbert" and confidence < confidence_threshold:
-        return None
-    return (subject, extracted_relation, obj, confidence)
-
+    return (subject, relation, obj, confidence)
 
 def deduplicate_relations(relations):
-    """
-    Deduplicate the extracted relation tuples.
-    For identical (subject, relation, object) tuples, only keep the one with the highest confidence.
-    Returns a list of deduplicated tuples sorted by confidence in descending order.
-    """
-    dedup = {}
-    for tup in relations:
-        subject, rel, obj, conf = tup
-        key = (subject.strip(), rel.strip(), obj.strip())
-        if key not in dedup or dedup[key] < conf:
-            dedup[key] = conf
-    processed = [(key[0], key[1], key[2], dedup[key]) for key in dedup]
-    processed.sort(key=lambda x: x[3], reverse=True)
-    return processed
-
-
-
+    seen = {}
+    for s, r, o, c in relations:
+        key = (s.strip(), r.strip(), o.strip())
+        if key not in seen or seen[key] < c:
+            seen[key] = c
+    # 按置信度降序
+    return sorted([(k[0], k[1], k[2], seen[k]) for k in seen], key=lambda x: x[3], reverse=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Project 2 - Iterative Information Extraction System")
-    parser.add_argument("method", choices=["spanbert", "-gemini"], help="Extraction method: spanbert or -gemini")
-    parser.add_argument("google_api_key", help="Google Custom Search API key")
-    parser.add_argument("google_engine_id", help="Google Custom Search Engine ID")
-    parser.add_argument("google_gemini_api_key", help="Google Gemini API key")
-    parser.add_argument("r", type=int, choices=[1, 2, 3, 4],
-                        help="Relation to extract (1: Schools_Attended, 2: Work_For, 3: Live_In, 4: Top_Member_Employees)")
-    parser.add_argument("t", type=float, help="Extraction confidence threshold (used for spanbert)")
-    parser.add_argument("q", help="Seed query, e.g., 'bill gates microsoft'")
-    parser.add_argument("k", type=int, help="Number of tuples to extract")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("method", choices=["spanbert", "-gemini"])
+    parser.add_argument("google_api_key")
+    parser.add_argument("google_engine_id")
+    parser.add_argument("google_gemini_api_key")
+    parser.add_argument("r", type=int, choices=[1, 2, 3, 4])
+    parser.add_argument("t", type=float)
+    parser.add_argument("q")
+    parser.add_argument("k", type=int)
     args = parser.parse_args()
 
-    print("Parameters:")
-    print(f"  Method           : {args.method}")
-    print(f"  Google API Key   : {args.google_api_key}")
-    print(f"  Engine ID        : {args.google_engine_id}")
-    print(f"  Gemini API Key   : {args.google_gemini_api_key}")
-    print(f"  Relation (r)     : {args.r}")
-    print(f"  Threshold (t)    : {args.t}")
-    print(f"  Seed Query (q)   : {args.q}")
-    print(f"  Number of Tuples : {args.k}\n")
+    # 如果 method 是 spanbert，则加载预训练的 SpanBERT 模型
+    spanbert_instance = None
 
-    max_iterations = 10
-    iteration_count = 0
-    # Store all extracted relation tuples
-    extracted_relations = []
-    # Track which tuples have been used as seeds for query expansion
-    used_seeds = set()
 
-    # Initial query from command line argument
-    current_query = args.q.lower()
+    if args.method == "spanbert":
+        print("Loading SpanBERT model...")
+        spanbert_instance = SpanBERT("SpanBERT/pretrained_spanbert")
+        from transformers import BertTokenizer
+        spanbert_instance.tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
 
-    while iteration_count < max_iterations:
-        print(f"\n===== Iteration {iteration_count+1} =====")
-        print(f"Current Query: {current_query}\n")
 
+    print("Starting Iterative Extraction...")
+    query = args.q.lower()
+    extracted = []
+    used = set()
+
+    for iteration in range(10):
+        print(f"\nIteration {iteration+1}: Query = {query}")
         try:
-            res = search_google(args.google_api_key, args.google_engine_id, current_query)
+            res = search_google(args.google_api_key, args.google_engine_id, query)
         except Exception as e:
-            print(f"Error during Google search: {e}")
+            print(f"Search error: {e}")
             break
 
-        new_extracted = []
+        new_relations = []
         if "items" not in res:
-            print("No search results returned.")
-        else:
-            for item in res.get("items", []):
-                url = item.get("link")
-                print(f"\nProcessing URL: {url}")
-                html = download_webpage(url)
-                if html:
-                    text = extract_text(html)
-                    print(f"Extracted text length: {len(text)}")
-                    annotations = annotate_text(text)
-                    candidates = candidate_entity_pairs(annotations, args.r)
-                    print(f"Found {len(candidates)} candidate entity pairs.")
-                    for candidate in candidates:
-                        result = extract_relation(candidate, args.method, args.t)
-                        if result is not None:
-                            new_extracted.append(result)
-                else:
-                    print("Failed to download the webpage.")
+            print("No search results.")
+            continue
+        for item in res["items"]:
+            url = item.get("link")
+            print(f"Processing: {url}")
+            html = download_webpage(url)
+            if not html:
+                continue
+            text = extract_text(html)
+            annots = annotate_text(text)
+            candidates = candidate_entity_pairs(annots, args.r)
+            for c in candidates:
+                result = extract_relation(c, args.method, args.t, args.google_gemini_api_key, spanbert_instance)
+                if result:
+                    new_relations.append(result)
 
-        # Combine new extracted tuples with previous ones and deduplicate
-        extracted_relations = deduplicate_relations(extracted_relations + new_extracted)
-        print(f"\nTotal extracted relations so far: {len(extracted_relations)}")
-
-        # Check if we have reached the desired number of tuples
-        if len(extracted_relations) >= args.k:
-            print("Desired number of tuples extracted. Stopping iterations.")
+        extracted = deduplicate_relations(extracted + new_relations)
+        print(f"Total extracted so far: {len(extracted)}")
+        if len(extracted) >= args.k:
             break
 
-        # Select an unused seed tuple from extracted_relations to generate a new query
-        seed_tuple = None
-        for tup in extracted_relations:
-            key = (tup[0].strip(), tup[1].strip(), tup[2].strip())
-            if key not in used_seeds:
-                seed_tuple = tup
-                used_seeds.add(key)
+        # 选择一个新的种子元组来生成下一次查询
+        for s, r, o, _ in extracted:
+            key = (s.strip(), r.strip(), o.strip())
+            if key not in used:
+                query = f"{s} {o}".lower()
+                used.add(key)
                 break
-
-        if seed_tuple is None:
-            print("No new seed tuple found. ISE has stalled.")
+        else:
+            print("No new seed found. Stopping.")
             break
 
-        # Construct a new query using the seed tuple's subject and object
-        new_query = f"{seed_tuple[0]} {seed_tuple[2]}"
-        current_query = new_query.lower()
-
-        iteration_count += 1
-
-    # Final output: deduplicate and take the top k tuples sorted by confidence
-    final_relations = extracted_relations[:args.k]
-    print("\n===== Final Extracted Relations =====")
-    for tup in final_relations:
-        subject, rel, obj, conf = tup
-        print(f"[Subject: {subject}, Relation: {rel}, Object: {obj}, Confidence: {conf}]")
-    if len(final_relations) < args.k:
-        print(f"Warning: Only {len(final_relations)} tuples extracted, which is less than the desired {args.k}.")
+    print("\nFinal Extracted Relations:")
+    for s, r, o, c in extracted[:args.k]:
+        print(f"[Subject: {s}, Relation: {r}, Object: {o}, Confidence: {c:.2f}]")
 
 if __name__ == "__main__":
     main()
