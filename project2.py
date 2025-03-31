@@ -1,15 +1,15 @@
-# Mar 31 4:00pm
+# temporary last version 31 6:30pm
 import argparse
 import nltk
 from nltk.corpus import stopwords
 from googleapiclient.discovery import build
-from sklearn.feature_extraction.text import TfidfVectorizer
+# from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import spacy
 import requests
 from bs4 import BeautifulSoup
-import json
 import google.generativeai as genai
+from SpanBERT.spanbert import SpanBERT
 
 # Try importing newspaper3k. If not installed, related logic will be skipped.
 try:
@@ -17,20 +17,7 @@ try:
 except ImportError:
     Article = None
 
-# Try importing Google Gemini API
-try:
-    import google.generativeai as palm
-except ImportError:
-    print("Please install google-generativeai: pip install -q -U google-generativeai")
-    palm = None
 
-# Import SpanBERT class from the SpanBERT repository
-from SpanBERT.spanbert import SpanBERT
-
-
-
-nltk.download('stopwords')
-nltk.download('punkt')
 
 nlp = spacy.load("en_core_web_lg")
 
@@ -146,21 +133,18 @@ def candidate_entity_pairs(annotations, relation):
 
 
 def run_spanbert(sentence, subject, obj, spanbert_instance):
-    # 使用 spaCy 处理句子
+    # use spaCy for sentences
     doc = nlp(sentence)
     
-    # 尝试用 str.find 定位实体在句子中的字符位置
     subj_start = sentence.find(subject)
     obj_start = sentence.find(obj)
     
-    # 如果找不到实体，则返回空结果
     if subj_start == -1 or obj_start == -1:
         return "", 0.0
     
     subj_end = subj_start + len(subject)
     obj_end = obj_start + len(obj)
     
-    # 将字符范围映射到 spaCy 的 token 范围
     subj_span = doc.char_span(subj_start, subj_end)
     obj_span = doc.char_span(obj_start, obj_end)
     if subj_span is None or obj_span is None:
@@ -189,14 +173,6 @@ def run_spanbert(sentence, subject, obj, spanbert_instance):
     print("Object span:", obj_span.start, obj_span.end)
 
     return "", 0.0
-
-def test_run_spanbert(spanbert_instance):
-    sentence = "Bill Gates works for Microsoft."
-    subject = "Bill Gates"
-    obj = "Microsoft"
-    relation, confidence = run_spanbert(sentence, subject, obj, spanbert_instance)
-    print("Predicted relation:", relation, "Confidence:", confidence)
-
 
 
 def run_gemini(sentence, subject, obj, gemini_api_key):
@@ -256,7 +232,7 @@ def print_header(args):
     print("\tGemini key\t= {}".format(args.google_gemini_api_key))
     method_str = args.method
     print("\tMethod\t= {}".format(method_str))
-    # 根据关系号映射对应的关系名称（例如：1 对应 Schools_Attended）
+
     relation_names = {1: "Schools_Attended", 2: "Work_For", 3: "Live_In", 4: "Top_Member_Employees"}
     print("\tRelation\t= {}".format(relation_names.get(args.r, "Unknown")))
     print("\tThreshold\t= {}".format(args.t))
@@ -271,7 +247,8 @@ def process_url(url, url_index, total_urls, args, spanbert_instance):
     if not html:
         print("\tUnable to fetch URL. Continuing.")
         return None, 0
-    # 如果内容太长，则打印截断信息
+
+
     if len(html) > 10000:
         print("\tTrimming webpage content from {} to 10000 characters".format(len(html)))
     print("\tWebpage length (num characters): {}".format(min(len(html), 10000)))
@@ -279,12 +256,12 @@ def process_url(url, url_index, total_urls, args, spanbert_instance):
     text = extract_text(html)
     annots = annotate_text(text)
     print("\tExtracted {} sentences. Processing each sentence one by one to check for presence of right pair of named entity types; if so, will run the second pipeline ...".format(len(annots)))
-    # 模拟逐步处理的输出
+    # 
     step = max(1, len(annots)//5)
     for i in range(len(annots)):
         if i % step == 0:
             print("\tProcessed {} / {} sentences".format(i, len(annots)))
-    # 对每个候选实体对进行关系抽取
+    # 
     candidates = candidate_entity_pairs(annots, args.r)
     extracted = []
     for c in candidates:
@@ -306,7 +283,7 @@ def main():
     parser.add_argument("k", type=int)
     args = parser.parse_args()
 
-    # 打印头部信息
+    
     print_header(args)
 
     # Load SpanBERT model if using spanbert method
@@ -321,8 +298,13 @@ def main():
     query = args.q.lower()
     extracted_relations = []
     used = set()
+
+    # record used URL
+    processed_urls = set()
+
+
     total_iterations = 0
-    # 假设最多迭代10次
+    # 10 times
     for iteration in range(10):
         total_iterations = iteration + 1
         print("\n=========== Iteration: {} - Query: {} ===========".format(iteration, query))
@@ -339,7 +321,12 @@ def main():
         new_relations = []
         urls = [item.get("link") for item in res["items"]]
         total_urls = len(urls)
+
         for idx, url in enumerate(urls, 1):
+            if url in processed_urls:
+                continue
+            
+            processed_urls.add(url)
             rels, _ = process_url(url, idx, total_urls, args, spanbert_instance)
             if rels:
                 new_relations.extend(rels)
@@ -349,7 +336,7 @@ def main():
         if len(extracted_relations) >= args.k:
             break
 
-        # 选择新的 seed tuple 构造查询
+        # new seed tuple for search
         for s, r, o, _ in extracted_relations:
             key = (s.strip(), r.strip(), o.strip())
             if key not in used:
