@@ -286,10 +286,10 @@ def main():
     
     print_header(args)
 
-    # Load SpanBERT model if using spanbert method
+    # Load SpanBERT_orig model if using spanbert method
     spanbert_instance = None
     if args.method == "spanbert":
-        print("Loading SpanBERT model...")
+        print("Loading SpanBERT_orig model...")
         spanbert_instance = SpanBERT("./pretrained_spanbert")
         from transformers import BertTokenizer
         spanbert_instance.tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
