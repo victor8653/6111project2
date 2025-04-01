@@ -9,7 +9,7 @@ import spacy
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from SpanBERT.spanbert import SpanBERT
+from spanbert import SpanBERT
 
 # Try importing newspaper3k. If not installed, related logic will be skipped.
 try:
