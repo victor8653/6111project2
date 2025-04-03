@@ -1,21 +1,15 @@
-# temporary last version 31 6:30pm
 import argparse
-import nltk
-from nltk.corpus import stopwords
+import time
 from googleapiclient.discovery import build
-# from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
 import spacy
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from spanbert import SpanBERT
 
-# Try importing newspaper3k. If not installed, related logic will be skipped.
-try:
-    from newspaper import Article
-except ImportError:
-    Article = None
+
+from spanbert import SpanBERT
+from spacy_help_functions import create_entity_pairs
+
 
 
 
@@ -38,144 +32,92 @@ def download_webpage(url, timeout=10):
         print(f"Error while requesting {url}: {e}")
     return None
 
-def extract_text(html):
-    """
-    改进后的文本提取：尝试 newspaper3k、readability-lxml、然后回退到 BeautifulSoup。
-    """
-    text = ""
-    # Try extracting with newspaper3k
-    try:
-        if Article is not None:
-            article = Article(url="")
-            article.set_html(html)
-            article.parse()
-            text = article.text
-    except Exception:
-        pass
+def extract_text_spanbert(html):
+    soup = BeautifulSoup(html, 'html.parser')
 
-    # If newspaper3k result is insufficient, try readability-lxml
-    if not text or len(text) < 200:
-        try:
-            from readability import Document
-            doc = Document(html)
-            extracted_html = doc.summary()
-            text = BeautifulSoup(extracted_html, 'html.parser').get_text(separator=" ", strip=True)
-        except Exception:
-            pass
+    paragraphs = soup.find_all('p')
+    text = " ".join(p.get_text(separator=" ", strip=True) for p in paragraphs)
+    text = text.replace('\n', ' ').replace('\t', '').replace('\xa0', '')
+    return text[:10000]
 
-    # If still insufficient, use BeautifulSoup
-    if not text or len(text) < 200:
-        soup = BeautifulSoup(html, 'html.parser')
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-            tag.decompose()
-        article_tag = soup.find("article")
-        if article_tag:
-            text = article_tag.get_text(separator=" ", strip=True)
+def extract_text_gemini(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        tag.decompose()
+    article_tag = soup.find("article")
+    if article_tag:
+        text = article_tag.get_text(separator=" ", strip=True)
+    else:
+        main_div = soup.find("div", id="main") or soup.find("div", class_="content")
+        if main_div:
+            text = main_div.get_text(separator=" ", strip=True)
         else:
-            main_div = soup.find("div", id="main") or soup.find("div", class_="content")
-            if main_div:
-                text = main_div.get_text(separator=" ", strip=True)
-            else:
-                text = soup.get_text(separator=" ", strip=True)
+            text = soup.get_text(separator=" ", strip=True)
 
     text = " ".join(text.split())
     return text[:10000]
 
-def annotate_text(text):
-    doc = nlp(text)
-    annotated_sentences = []
-    for sent in doc.sents:
-        s = sent.text.strip()
-        if len(s) < 20:
-            continue
-        lower_s = s.lower()
-        if sum(1 for nav in NAV_WORDS if nav in lower_s) > 1:
-            continue
-        entities = [(ent.text, ent.label_) for ent in sent.ents]
-        annotated_sentences.append((s, entities))
-    return annotated_sentences
 
 def is_valid_entity(entity):
     entity_lower = entity.lower().strip()
     return len(entity_lower) >= 3 and entity_lower not in NAV_WORDS
 
-def candidate_entity_pairs(annotations, relation):
-    pairs = []
-    for sentence, entities in annotations:
-        valid = [(ent, label) for ent, label in entities if is_valid_entity(ent)]
-        for i in range(len(valid)):
-            for j in range(i + 1, len(valid)):
-                e1, l1 = valid[i]
-                e2, l2 = valid[j]
-                if relation == 2:  # Work_For
-                    # only PERSON and ORG 
-                    if l1 == "PERSON" and l2 == "ORG":
-                        pairs.append((sentence, e1, e2))
-                    elif l2 == "PERSON" and l1 == "ORG":
-                        pairs.append((sentence, e2, e1))
-                elif relation == 1:  # Schools_Attended and GPE or ORG
-                    if l1 == "PERSON" and l2 in ["ORG", "GPE"]:
-                        pairs.append((sentence, e1, e2))
-                    elif l2 == "PERSON" and l1 in ["ORG", "GPE"]:
-                        pairs.append((sentence, e2, e1))
-                elif relation == 3:  # Live_In
-                    if l1 == "PERSON" and l2 in ["GPE", "LOC"]:
-                        pairs.append((sentence, e1, e2))
-                    elif l2 == "PERSON" and l1 in ["GPE", "LOC"]:
-                        pairs.append((sentence, e2, e1))
-                elif relation == 4:  # Top_Member_Employees
-                    if l1 == "ORG" and l2 == "PERSON":
-                        pairs.append((sentence, e1, e2))
-                    elif l2 == "ORG" and l1 == "PERSON":
-                        pairs.append((sentence, e2, e1))
-    return pairs
+
+
+def filter_entity_pairs(entity_pairs, r):
+    filtered_candidates = []
+
+    for context, e1_info, e2_info in entity_pairs:
+        e1_text, e1_label, e1_span = e1_info
+        e2_text, e2_label, e2_span = e2_info
+
+        # Relation 1: Schools_Attended
+        if r == 1:
+            if e1_label == "PERSON" and e2_label == "ORGANIZATION":
+                filtered_candidates.append((context, e1_info, e2_info))
+            elif e2_label == "PERSON" and e1_label == "ORGANIZATION":
+                filtered_candidates.append((context, e2_info, e1_info))
+
+        # Relation 2: Work_For
+        elif r == 2:
+            if e1_label == "PERSON" and e2_label == "ORGANIZATION":
+                filtered_candidates.append((context, e1_info, e2_info))
+            elif e2_label == "PERSON" and e1_label == "ORGANIZATION":
+                filtered_candidates.append((context, e2_info, e1_info))
+
+        # Relation 3: Live_In
+        elif r == 3:
+            if e1_label == "PERSON" and e2_label in ["LOCATION", "CITY", "STATE_OR_PROVINCE", "COUNTRY"]:
+                filtered_candidates.append((context, e1_info, e2_info))
+            elif e2_label == "PERSON" and e1_label in ["LOCATION", "CITY", "STATE_OR_PROVINCE", "COUNTRY"]:
+                filtered_candidates.append((context, e2_info, e1_info))
+
+        # Relation 4: Top_Member_Employees
+        elif r == 4:
+            if e1_label == "ORGANIZATION" and e2_label == "PERSON":
+                filtered_candidates.append((context, e1_info, e2_info))
+            elif e2_label == "ORGANIZATION" and e1_label == "PERSON":
+                filtered_candidates.append((context, e2_info, e1_info))
+
+    return filtered_candidates
 
 
 
-def run_spanbert(sentence, subject, obj, spanbert_instance):
-    # use spaCy for sentences
-    doc = nlp(sentence)
-    
-    subj_start = sentence.find(subject)
-    obj_start = sentence.find(obj)
-    
-    if subj_start == -1 or obj_start == -1:
-        return "", 0.0
-    
-    subj_end = subj_start + len(subject)
-    obj_end = obj_start + len(obj)
-    
-    subj_span = doc.char_span(subj_start, subj_end)
-    obj_span = doc.char_span(obj_start, obj_end)
-    if subj_span is None or obj_span is None:
-        return "", 0.0
-    
-    subj_token_start = subj_span.start
-    subj_token_end = subj_span.end
-    obj_token_start = obj_span.start
-    obj_token_end = obj_span.end
-    
-    tokens = [token.text for token in doc]
-    
-    example = {
-        'tokens': tokens,
-        'subj': (subject, "PERSON", (subj_token_start, subj_token_end)),
-        'obj': (obj, "ORGANIZATION", (obj_token_start, obj_token_end))
-    }
-    
+def run_spanbert(example, r, spanbert_instance):
     preds = spanbert_instance.predict([example])
     if preds and len(preds) > 0:
         relation, confidence = preds[0]
+        if (r == 1 and relation != 'per:schools_attended') or (r == 2 and relation != 'per:employee_of') or (
+                r == 3 and (relation not in (
+        'per:countries_of_residence', 'per:cities_of_residence', 'per:stateorprovinces_of_residence')) or (
+                        r == 4 and relation != 'org:top_members/employees')):
+            return "", 0.0
         return relation, confidence
 
-    print("Tokens:", tokens)
-    print("Subject span:", subj_span.start, subj_span.end)
-    print("Object span:", obj_span.start, obj_span.end)
-
-    return "", 0.0
 
 
-def run_gemini(sentence, subject, obj, gemini_api_key):
+def run_gemini(sentence, subject, obj, gemini_api_key, r):
+    time.sleep(5)
     genai.configure(api_key=gemini_api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
 
@@ -189,27 +131,36 @@ def run_gemini(sentence, subject, obj, gemini_api_key):
         Given the sentence:
         \"{sentence}\"
 
-        What is the relation between \"{subject}\" and \"{obj}\"? 
+        What is the relation between \"{subject}\" and \"{obj}\"?
         Only answer with the relation name if it exists, otherwise say "no_relation".
         """
 
     try:
         response = model.generate_content(prompt, generation_config=generation_config)
         result = response.text.strip().lower()
-        return result, 1.0  
+        return result, 1.0
     except Exception as e:
         print("Error in Gemini API call:", e)
         return "no_relation", 0.0
 
 
-def extract_relation(candidate, method, confidence_threshold, gemini_api_key, spanbert_instance=None):
-    sentence, subject, obj = candidate
+
+
+def extract_relation(candidate, method, confidence_threshold, gemini_api_key, r, spanbert_instance=None):
+    tokens, entity1, entity2 = candidate
+
+    subject, subject_label, subject_span = entity1
+    obj, obj_label, obj_span = entity2
+
+    sentence = ' '.join(tokens)
+
+    spanbert_ex ={"tokens": tokens, "subj": entity1, "obj": entity2}
     if method == "spanbert":
-        relation, confidence = run_spanbert(sentence, subject, obj, spanbert_instance)
+        relation, confidence = run_spanbert(spanbert_ex, r, spanbert_instance)
         if confidence < confidence_threshold:
             return None
     elif method == "gemini":
-        relation, confidence = run_gemini(sentence, subject, obj, gemini_api_key)
+        relation, confidence = run_gemini(sentence, subject, obj, gemini_api_key, r)
     else:
         return None
     return (subject, relation, obj, confidence)
@@ -223,14 +174,13 @@ def deduplicate_relations(relations):
     # 
     return sorted([(k[0], k[1], k[2], seen[k]) for k in seen], key=lambda x: x[3], reverse=True)
 
-def print_header(args):
-    print("Loading pre-trained spanBERT from ./pretrained_spanbert\n")
+def print_header(args, method):
     print("____")
     print("Parameters:")
     print("\tClient key\t= {}".format(args.google_api_key))
     print("\tEngine key\t= {}".format(args.google_engine_id))
     print("\tGemini key\t= {}".format(args.google_gemini_api_key))
-    method_str = args.method
+    method_str = method
     print("\tMethod\t= {}".format(method_str))
 
     relation_names = {1: "Schools_Attended", 2: "Work_For", 3: "Live_In", 4: "Top_Member_Employees"}
@@ -240,8 +190,20 @@ def print_header(args):
     print("\t# of Tuples\t= {}".format(args.k))
     print("Loading necessary libraries; This should take a minute or so ...)")
     
-def process_url(url, url_index, total_urls, args, spanbert_instance):
+def process_url(url, url_index, total_urls, args, spanbert_instance, method, res):
     print("\nURL ( {} / {}): {}".format(url_index, total_urls, url))
+
+    item = res["items"][url_index - 1]
+
+    skip_url = False
+    if "fileFormat" in item and item["fileFormat"].lower() != "html":
+        print(f"Skipping non-HTML file: {item.get('title')} with format {item['fileFormat']}")
+        skip_url = True
+
+    if skip_url:
+        return None, 0
+
+
     print("\tFetching text from url ...")
     html = download_webpage(url)
     if not html:
@@ -253,27 +215,38 @@ def process_url(url, url_index, total_urls, args, spanbert_instance):
         print("\tTrimming webpage content from {} to 10000 characters".format(len(html)))
     print("\tWebpage length (num characters): {}".format(min(len(html), 10000)))
     print("\tAnnotating the webpage using spacy...")
-    text = extract_text(html)
-    annots = annotate_text(text)
-    print("\tExtracted {} sentences. Processing each sentence one by one to check for presence of right pair of named entity types; if so, will run the second pipeline ...".format(len(annots)))
+    if method == "spanbert":
+        text = extract_text_spanbert(html)
+    else:
+        text = extract_text_gemini(html)
+    doc = nlp(text)
+    num_sents = len([sent for sent in doc.sents])
+    print("\tExtracted {} sentences. Processing each sentence one by one to check for presence of right pair of named entity types; if so, will run the second pipeline ...".format(num_sents))
     # 
-    step = max(1, len(annots)//5)
-    for i in range(len(annots)):
+    step = max(1, num_sents//5)
+    for i in range(num_sents):
         if i % step == 0:
-            print("\tProcessed {} / {} sentences".format(i, len(annots)))
-    # 
-    candidates = candidate_entity_pairs(annots, args.r)
+            print("\tProcessed {} / {} sentences".format(i, num_sents))
+    unfiltered_candidates = []
+    entities_of_interest = ["PERSON", "LOCATION", "CITY", "ORGANIZATION", "STATE_OR_PROVINCE", "COUNTRY"]
+    for sents_doc in doc.sents:
+        entity_pairs = create_entity_pairs(sents_doc, entities_of_interest)
+        unfiltered_candidates.extend(entity_pairs)
+
+    candidates = filter_entity_pairs(unfiltered_candidates, args.r)
     extracted = []
     for c in candidates:
-        result = extract_relation(c, args.method, args.t, args.google_gemini_api_key, spanbert_instance)
+        result = extract_relation(c, method, args.t, args.google_gemini_api_key, args.r, spanbert_instance)
         if result:
             extracted.append(result)
     print("\tRelations extracted from this website: {} (Overall: {})".format(len(extracted), len(extracted)))
-    return extracted, len(annots)
+    return extracted, num_sents
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("method", choices=["spanbert", "gemini"])
+    parser.add_argument("-spanbert", action="store_true", help="Use SpanBERT for relation extraction")
+    parser.add_argument("-gemini", action="store_true", help="Use Gemini for relation extraction")
     parser.add_argument("google_api_key")
     parser.add_argument("google_engine_id")
     parser.add_argument("google_gemini_api_key")
@@ -281,22 +254,32 @@ def main():
     parser.add_argument("t", type=float)
     parser.add_argument("q")
     parser.add_argument("k", type=int)
+
     args = parser.parse_args()
 
-    
-    print_header(args)
+    if not (args.spanbert or args.gemini):
+        print("Error: You must specify either '-spanbert' or '-gemini'.")
+        return
 
-    # Load SpanBERT_orig model if using spanbert method
+    if args.spanbert:
+        method = "spanbert"
+    elif args.gemini:
+        method = "gemini"
+
+    
+    print_header(args, method)
+
+    # Initialize X, the set of extracted tuples
+    extracted_relations = []
+
     spanbert_instance = None
-    if args.method == "spanbert":
-        print("Loading SpanBERT_orig model...")
+    if method == "spanbert":
+        print("Loading SpanBERT model...")
         spanbert_instance = SpanBERT("./pretrained_spanbert")
-        from transformers import BertTokenizer
-        spanbert_instance.tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
 
     print("=========== Iteration: 0 - Query: {} ===========".format(args.q.lower()))
     query = args.q.lower()
-    extracted_relations = []
+    # extracted_relations = []
     used = set()
 
     # record used URL
@@ -327,7 +310,7 @@ def main():
                 continue
             
             processed_urls.add(url)
-            rels, _ = process_url(url, idx, total_urls, args, spanbert_instance)
+            rels, _ = process_url(url, idx, total_urls, args, spanbert_instance, method, res)
             if rels:
                 new_relations.extend(rels)
 
@@ -349,9 +332,12 @@ def main():
 
     print("\n================== ALL RELATIONS for {} ( {} ) =================".format(
         {1: "per:schools_attended", 2: "per:employee_of", 3: "per:cities_of_residence", 4: "org:top_members/employees"}.get(args.r, "unknown"),
-        args.k))
-    for s, r, o, c in extracted_relations[:args.k]:
-        print("Confidence: {:.8f} \t\t| Subject: {} \t\t| Object: {}".format(c, s, o))
+        len(extracted_relations)))
+    for s, r, o, c in extracted_relations:
+        if method == "spanbert":
+            print("Confidence: {:.8f} \t\t| Subject: {} \t\t| Object: {}".format(c, s, o))
+        else: print("Subject: {} \t\t| Object: {}".format( s, o))
+
     print("Total # of iterations = {}".format(total_iterations))
 
 if __name__ == "__main__":
